@@ -39,6 +39,33 @@
         let solverSocket = null;
         let commandIsComplete = false;
 
+        let interceptor = null;
+        window.interceptSolver = function(onMessage, onRequest) {
+            if (interceptor) {
+                // disable previous interceptor
+                interceptor.active = false;
+            }
+            const local = { onMessage, onRequest, active: true };
+            interceptor = local;
+
+            const send = (message) => {
+                if (!local.active) throw new Error('Interceptor removed');
+                if (!solverSocket) throw new Error('Disconnected');
+                solverSocket.send(JSON.stringify(message));
+            }
+            const processResponse = (resp) => {
+                if (!local.active) throw new Error('Interceptor removed');
+                handleResponse(resp)
+            };
+            const disconnect = () => {
+                if (interceptor === local) {
+                    interceptor = null;
+                    local.active = false;
+                }
+            }
+            return { send, processResponse, disconnect };
+        }
+
         const exportPuzzleForSolving = function(includeCandidates) {
             const compressed = exportPuzzle(includeCandidates);
             const puzzle = JSON.parse(compressor.decompressFromBase64(compressed));
@@ -59,12 +86,17 @@
                 puzzle.truecandidatesoptions.push('logical');
             }
 
-            return compressor.compressToBase64(JSON.stringify(puzzle));
+            return puzzle;
         }
 
-        const sendPuzzleDelayed = function(message) {
+        const sendPuzzleDelayed = async function(message, puzzle) {
             if (nonce === message.nonce) {
-                solverSocket.send(JSON.stringify(message));
+                if (interceptor?.onRequest) {
+                    message = interceptor.onRequest(message, puzzle);
+                }
+                if (message && solverSocket) {
+                    solverSocket.send(JSON.stringify(message));
+                }
             }
         }
 
@@ -79,6 +111,7 @@
                     nonce: nonce,
                     command: 'cancel',
                 }
+                interceptor?.onRequest?.(message); // interceptor should not prevent/modify cancel message
                 solverSocket.send(JSON.stringify(message));
                 return;
             }
@@ -88,9 +121,9 @@
                 nonce: nonce,
                 command: command,
                 dataType: 'fpuzzles',
-                data: puzzle
+                data: compressor.compressToBase64(JSON.stringify(puzzle)),
             }
-            setTimeout(() => sendPuzzleDelayed(message), 250);
+            setTimeout(() => sendPuzzleDelayed(message, puzzle), 250);
 
             connectButton.title = "Calculating...";
 
@@ -557,6 +590,49 @@
             }
         }
 
+        const handleResponse = function(response) {
+            if (response.nonce && response.nonce !== nonce) {
+                return;
+            }
+            if (!allowCommandWhenUndo[lastCommand] && changeIndex < changes.length - 1) {
+                // Undo has been pressed
+                return;
+            }
+
+            if (response.type === 'canceled') {
+                log('Operation canceled.');
+                if (cancelButton) {
+                    cancelButton.title = cancelButton.origTitle;
+                    cancelButton = null;
+                }
+                connectButton.title = 'Disconnect';
+                commandIsComplete = true;
+                return;
+            }
+
+            processingMessage = true;
+            commandIsComplete = true;
+            if (lastCommand === 'truecandidates') {
+                handleTrueCandidates(response);
+            } else if (lastCommand === 'solve') {
+                handleSolve(response);
+            } else if (lastCommand === 'check') {
+                handleCheck(response);
+            } else if (lastCommand === 'count') {
+                handleCount(response);
+            } else if (lastCommand === 'solvepath') {
+                handlePath(response);
+            } else if (lastCommand === 'step') {
+                handleStep(response);
+            }
+
+            if (commandIsComplete) {
+                connectButton.title = 'Disconnect';
+                commandIsComplete = false;
+            }
+            processingMessage = false;
+        }
+
         let processingMessage = false;
         connectButton.click = function() {
             if (!this.hovering()) {
@@ -575,45 +651,12 @@
                 };
 
                 socket.onmessage = function(msg) {
-                    const response = JSON.parse(msg.data);
-                    if (response.nonce === nonce) {
-                        if (!allowCommandWhenUndo[lastCommand] && changeIndex < changes.length - 1) {
-                            // Undo has been pressed
-                            return;
-                        }
-
-                        if (response.type === 'canceled') {
-                            log('Operation canceled.');
-                            if (cancelButton) {
-                                cancelButton.title = cancelButton.origTitle;
-                                cancelButton = null;
-                            }
-                            connectButton.title = 'Disconnect';
-                            commandIsComplete = true;
-                            return;
-                        }
-
-                        processingMessage = true;
-                        commandIsComplete = true;
-                        if (lastCommand === 'truecandidates') {
-                            handleTrueCandidates(response);
-                        } else if (lastCommand === 'solve') {
-                            handleSolve(response);
-                        } else if (lastCommand === 'check') {
-                            handleCheck(response);
-                        } else if (lastCommand === 'count') {
-                            handleCount(response);
-                        } else if (lastCommand === 'solvepath') {
-                            handlePath(response);
-                        } else if (lastCommand === 'step') {
-                            handleStep(response);
-                        }
-
-                        if (commandIsComplete) {
-                            connectButton.title = 'Disconnect';
-                            commandIsComplete = false;
-                        }
-                        processingMessage = false;
+                    let response = JSON.parse(msg.data);
+                    if (interceptor?.onMessage) {
+                        response = interceptor.onMessage(response);
+                    }
+                    if (response) {
+                        handleResponse(response)
                     }
                 };
 
